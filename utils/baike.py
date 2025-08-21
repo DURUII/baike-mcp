@@ -7,6 +7,7 @@ import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 import html2text
+import time
 
 
 # def fetch_baike_api(name: str) -> dict:
@@ -48,6 +49,27 @@ def make_session() -> requests.Session:
 	return s
 
 SESSION = make_session()
+
+# 简单内存缓存（进程级），用于减少重复请求
+CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 小时
+_BAIKE_CACHE = {}
+
+def _cache_get(key: str):
+	entry = _BAIKE_CACHE.get(key)
+	if not entry:
+		return None
+	ts, data = entry
+	if time.time() - ts > CACHE_TTL_SECONDS:
+		_BAIKE_CACHE.pop(key, None)
+		return None
+	return data
+
+def _cache_put(key: str, data: dict) -> None:
+	_BAIKE_CACHE[key] = (time.time(), data)
+	# 简单 size 上限，淘汰最旧项
+	if len(_BAIKE_CACHE) > 256:
+		oldest_key = min(_BAIKE_CACHE.items(), key=lambda kv: kv[1][0])[0]
+		_BAIKE_CACHE.pop(oldest_key, None)
 
 def fetch(url: str) -> requests.Response:
 	resp = SESSION.get(url, timeout=10, allow_redirects=True)
@@ -298,26 +320,33 @@ def extract_result(soup: BeautifulSoup, final_url: str) -> dict:
 		"episode_summary": unique,
 	}
 
+
 def fetch_baike(name: str) -> dict:
+	# 命中缓存
+	key = str(name).strip().lower()
+	cached = _cache_get(key)
+	if cached is not None:
+		return cached
 	encoded_name = quote(str(name).strip())
 	url = f"https://baike.baidu.com/item/{encoded_name}"
-	resp = fetch(url)
-	soup = BeautifulSoup(resp.text, "html.parser")
-	next_url = resolve_first_entry(soup, resp.url)
-	if next_url:
-		resp = fetch(next_url)
+	try:
+		resp = fetch(url)
 		soup = BeautifulSoup(resp.text, "html.parser")
-	return extract_result(soup, resp.url)
+		next_url = resolve_first_entry(soup, resp.url)
+		if next_url:
+			resp = fetch(next_url)
+			soup = BeautifulSoup(resp.text, "html.parser")
+		result = extract_result(soup, resp.url)
+		_cache_put(key, result)
+		return result
 	# except requests.HTTPError as e:
 	# 	print("b")
 	# 	status = getattr(e.response, "status_code", None)
 	# 	if status in (403, 429):
 	# 		return fetch_baike_api(name)
 	# 	raise
-	# except Exception:
-	# 	# 兜底：尝试 API
-	# 	print("C")
-	# 	return fetch_baike_api(name)
+	except Exception:
+		return {}
 
 
 if __name__ == "__main__":
